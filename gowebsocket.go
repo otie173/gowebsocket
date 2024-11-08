@@ -14,8 +14,7 @@ import (
 )
 
 // Empty struct for logger initialization
-type Empty struct {
-}
+type Empty struct{}
 
 // Initialize logger
 var logger = logging.GetLogger(reflect.TypeOf(Empty{}).PkgPath()).SetLevel(logging.OFF)
@@ -46,9 +45,11 @@ type Socket struct {
 	OnPongReceived    func(data string, socket Socket)
 	IsConnected       bool
 	Timeout           time.Duration
-	sendMu            *sync.Mutex // Mutex to prevent concurrent writes
-	receiveMu         *sync.Mutex // Mutex to prevent concurrent reads
-	connStateMu       sync.Mutex  // Mutex to protect connection state
+	sendMu            sync.Mutex     // Mutex to prevent concurrent writes
+	receiveMu         sync.Mutex     // Mutex to prevent concurrent reads
+	connStateMu       sync.Mutex     // Mutex to protect connection state
+	closeChan         chan struct{}  // Channel to signal closing
+	closeWg           sync.WaitGroup // WaitGroup to wait for goroutines
 }
 
 // Connection options structure
@@ -61,6 +62,7 @@ type ConnectionOptions struct {
 
 // Reconnection options (to be implemented)
 type ReconnectionOptions struct {
+	// Fields for reconnection options
 }
 
 // Create a new Socket instance
@@ -74,8 +76,8 @@ func New(url string) Socket {
 		},
 		WebsocketDialer: &websocket.Dialer{},
 		Timeout:         0,
-		sendMu:          &sync.Mutex{},
-		receiveMu:       &sync.Mutex{},
+		closeChan:       make(chan struct{}),
+		// Other fields are zero-initialized
 	}
 }
 
@@ -93,6 +95,7 @@ func (socket *Socket) Connect() {
 	var resp *http.Response
 	socket.setConnectionOptions()
 
+	// Dial the websocket connection
 	socket.Conn, resp, err = socket.WebsocketDialer.Dial(socket.Url, socket.RequestHeader)
 
 	if err != nil {
@@ -156,37 +159,48 @@ func (socket *Socket) Connect() {
 		return result
 	})
 
+	// Initialize close channel and WaitGroup
+	socket.closeChan = make(chan struct{})
+	socket.closeWg.Add(1)
+
 	// Start reading messages
 	go func() {
+		defer socket.closeWg.Done()
 		for {
-			socket.receiveMu.Lock()
-			if socket.Timeout != 0 {
-				socket.Conn.SetReadDeadline(time.Now().Add(socket.Timeout))
-			}
-			messageType, message, err := socket.Conn.ReadMessage()
-			socket.receiveMu.Unlock()
-			if err != nil {
-				logger.Error.Println("read:", err)
-				socket.connStateMu.Lock()
-				socket.IsConnected = false
-				onDisconnected := socket.OnDisconnected
-				socket.connStateMu.Unlock()
-
-				if onDisconnected != nil {
-					onDisconnected(err, *socket)
-				}
+			select {
+			case <-socket.closeChan:
+				// Received close signal, exiting goroutine
 				return
-			}
-			logger.Info.Printf("recv: %s", message)
-
-			switch messageType {
-			case websocket.TextMessage:
-				if socket.OnTextMessage != nil {
-					socket.OnTextMessage(string(message), *socket)
+			default:
+				socket.receiveMu.Lock()
+				if socket.Timeout != 0 {
+					socket.Conn.SetReadDeadline(time.Now().Add(socket.Timeout))
 				}
-			case websocket.BinaryMessage:
-				if socket.OnBinaryMessage != nil {
-					socket.OnBinaryMessage(message, *socket)
+				messageType, message, err := socket.Conn.ReadMessage()
+				socket.receiveMu.Unlock()
+				if err != nil {
+					logger.Error.Println("read:", err)
+					socket.connStateMu.Lock()
+					socket.IsConnected = false
+					onDisconnected := socket.OnDisconnected
+					socket.connStateMu.Unlock()
+
+					if onDisconnected != nil {
+						onDisconnected(err, *socket)
+					}
+					return
+				}
+				logger.Info.Printf("recv: %s", message)
+
+				switch messageType {
+				case websocket.TextMessage:
+					if socket.OnTextMessage != nil {
+						socket.OnTextMessage(string(message), *socket)
+					}
+				case websocket.BinaryMessage:
+					if socket.OnBinaryMessage != nil {
+						socket.OnBinaryMessage(message, *socket)
+					}
 				}
 			}
 		}
@@ -227,8 +241,14 @@ func (socket *Socket) Close() {
 		logger.Error.Println("write close:", err)
 	}
 
-	// Close the connection
+	// Close the websocket connection
 	socket.Conn.Close()
+
+	// Signal the goroutine to exit
+	close(socket.closeChan)
+
+	// Wait for the goroutine to finish
+	socket.closeWg.Wait()
 
 	// Protect access to IsConnected and OnDisconnected
 	socket.connStateMu.Lock()
