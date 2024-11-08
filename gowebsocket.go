@@ -13,19 +13,24 @@ import (
 	logging "github.com/sacOO7/go-logger"
 )
 
+// Empty struct for logger initialization
 type Empty struct {
 }
 
+// Initialize logger
 var logger = logging.GetLogger(reflect.TypeOf(Empty{}).PkgPath()).SetLevel(logging.OFF)
 
+// Enable logging
 func (socket Socket) EnableLogging() {
 	logger.SetLevel(logging.TRACE)
 }
 
+// Get the logger instance
 func (socket Socket) GetLogger() logging.Logger {
 	return logger
 }
 
+// Socket structure
 type Socket struct {
 	Conn              *websocket.Conn
 	WebsocketDialer   *websocket.Dialer
@@ -41,10 +46,12 @@ type Socket struct {
 	OnPongReceived    func(data string, socket Socket)
 	IsConnected       bool
 	Timeout           time.Duration
-	sendMu            *sync.Mutex // Prevent "concurrent write to websocket connection"
-	receiveMu         *sync.Mutex
+	sendMu            *sync.Mutex // Mutex to prevent concurrent writes
+	receiveMu         *sync.Mutex // Mutex to prevent concurrent reads
+	connStateMu       sync.Mutex  // Mutex to protect connection state
 }
 
+// Connection options structure
 type ConnectionOptions struct {
 	UseCompression bool
 	UseSSL         bool
@@ -52,10 +59,11 @@ type ConnectionOptions struct {
 	Subprotocols   []string
 }
 
-// todo Yet to be done
+// Reconnection options (to be implemented)
 type ReconnectionOptions struct {
 }
 
+// Create a new Socket instance
 func New(url string) Socket {
 	return Socket{
 		Url:           url,
@@ -71,6 +79,7 @@ func New(url string) Socket {
 	}
 }
 
+// Set connection options based on the configuration
 func (socket *Socket) setConnectionOptions() {
 	socket.WebsocketDialer.EnableCompression = socket.ConnectionOptions.UseCompression
 	socket.WebsocketDialer.TLSClientConfig = &tls.Config{InsecureSkipVerify: socket.ConnectionOptions.UseSSL}
@@ -78,6 +87,7 @@ func (socket *Socket) setConnectionOptions() {
 	socket.WebsocketDialer.Subprotocols = socket.ConnectionOptions.Subprotocols
 }
 
+// Connect to the server
 func (socket *Socket) Connect() {
 	var err error
 	var resp *http.Response
@@ -86,24 +96,33 @@ func (socket *Socket) Connect() {
 	socket.Conn, resp, err = socket.WebsocketDialer.Dial(socket.Url, socket.RequestHeader)
 
 	if err != nil {
-		logger.Error.Println("Error while connecting to server ", err)
+		logger.Error.Println("Error while connecting to server:", err)
 		if resp != nil {
-			logger.Error.Println("HTTP Response %d status: %s", resp.StatusCode, resp.Status)
+			logger.Error.Printf("HTTP Response %d status: %s", resp.StatusCode, resp.Status)
 		}
+		socket.connStateMu.Lock()
 		socket.IsConnected = false
-		if socket.OnConnectError != nil {
-			socket.OnConnectError(err, *socket)
+		onConnectError := socket.OnConnectError
+		socket.connStateMu.Unlock()
+
+		if onConnectError != nil {
+			onConnectError(err, *socket)
 		}
 		return
 	}
 
 	logger.Info.Println("Connected to server")
 
-	if socket.OnConnected != nil {
-		socket.IsConnected = true
-		socket.OnConnected(*socket)
+	socket.connStateMu.Lock()
+	socket.IsConnected = true
+	onConnected := socket.OnConnected
+	socket.connStateMu.Unlock()
+
+	if onConnected != nil {
+		onConnected(*socket)
 	}
 
+	// Set up handlers
 	defaultPingHandler := socket.Conn.PingHandler()
 	socket.Conn.SetPingHandler(func(appData string) error {
 		logger.Trace.Println("Received PING from server")
@@ -125,14 +144,19 @@ func (socket *Socket) Connect() {
 	defaultCloseHandler := socket.Conn.CloseHandler()
 	socket.Conn.SetCloseHandler(func(code int, text string) error {
 		result := defaultCloseHandler(code, text)
-		logger.Warning.Println("Disconnected from server ", result)
-		if socket.OnDisconnected != nil {
-			socket.IsConnected = false
-			socket.OnDisconnected(errors.New(text), *socket)
+		logger.Warning.Println("Disconnected from server:", result)
+		socket.connStateMu.Lock()
+		socket.IsConnected = false
+		onDisconnected := socket.OnDisconnected
+		socket.connStateMu.Unlock()
+
+		if onDisconnected != nil {
+			onDisconnected(errors.New(text), *socket)
 		}
 		return result
 	})
 
+	// Start reading messages
 	go func() {
 		for {
 			socket.receiveMu.Lock()
@@ -143,13 +167,17 @@ func (socket *Socket) Connect() {
 			socket.receiveMu.Unlock()
 			if err != nil {
 				logger.Error.Println("read:", err)
-				if socket.OnDisconnected != nil {
-					socket.IsConnected = false
-					socket.OnDisconnected(err, *socket)
+				socket.connStateMu.Lock()
+				socket.IsConnected = false
+				onDisconnected := socket.OnDisconnected
+				socket.connStateMu.Unlock()
+
+				if onDisconnected != nil {
+					onDisconnected(err, *socket)
 				}
 				return
 			}
-			logger.Info.Println("recv: %s", message)
+			logger.Info.Printf("recv: %s", message)
 
 			switch messageType {
 			case websocket.TextMessage:
@@ -165,6 +193,7 @@ func (socket *Socket) Connect() {
 	}()
 }
 
+// Send a text message
 func (socket *Socket) SendText(message string) {
 	err := socket.send(websocket.TextMessage, []byte(message))
 	if err != nil {
@@ -173,6 +202,7 @@ func (socket *Socket) SendText(message string) {
 	}
 }
 
+// Send binary data
 func (socket *Socket) SendBinary(data []byte) {
 	err := socket.send(websocket.BinaryMessage, data)
 	if err != nil {
@@ -181,21 +211,33 @@ func (socket *Socket) SendBinary(data []byte) {
 	}
 }
 
+// Internal send function with synchronization
 func (socket *Socket) send(messageType int, data []byte) error {
 	socket.sendMu.Lock()
+	defer socket.sendMu.Unlock()
 	err := socket.Conn.WriteMessage(messageType, data)
-	socket.sendMu.Unlock()
 	return err
 }
 
+// Close the connection
 func (socket *Socket) Close() {
+	// Send close message
 	err := socket.send(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
 	if err != nil {
 		logger.Error.Println("write close:", err)
 	}
+
+	// Close the connection
 	socket.Conn.Close()
-	if socket.OnDisconnected != nil {
-		socket.IsConnected = false
-		socket.OnDisconnected(err, *socket)
+
+	// Protect access to IsConnected and OnDisconnected
+	socket.connStateMu.Lock()
+	socket.IsConnected = false
+	onDisconnected := socket.OnDisconnected
+	socket.connStateMu.Unlock()
+
+	// Call OnDisconnected callback outside of lock
+	if onDisconnected != nil {
+		onDisconnected(err, *socket)
 	}
 }
