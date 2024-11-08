@@ -1,4 +1,4 @@
-module github.com/sacOO7/gowebsocket
+module github.com/otie173/webgo
 
 go 1.16
 
